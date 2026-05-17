@@ -1,6 +1,8 @@
-# Agentic Data Science System
+# agentic_datascience_system
 
-一个面向中文数据分析场景的智能数据科学原型平台，当前包含：
+面向中文数据分析场景的智能数据科学原型平台。
+
+## 当前能力
 
 - 数据导入与 SQLite 历史回读
 - 字段类型自动识别与人工标注
@@ -11,15 +13,13 @@
 
 ## 环境准备
 
-推荐使用 `conda` 环境运行：
-
 ```powershell
 conda create -n rag310 python=3.10 -y
 conda activate rag310
 pip install -r requirements.txt
 ```
 
-## 启动方式
+## 启动
 
 ```powershell
 conda run -n rag310 streamlit run app/ui/streamlit_app.py
@@ -31,7 +31,7 @@ conda run -n rag310 streamlit run app/ui/streamlit_app.py
 conda run -n rag310 python tests\smoke_check.py
 ```
 
-## 当前技术栈
+## 技术栈
 
 - Python
 - Streamlit
@@ -40,15 +40,3 @@ conda run -n rag310 python tests\smoke_check.py
 - statsmodels
 - SQLite
 
-## 项目结构
-
-```text
-app/
-  core/        核心算法与分析逻辑
-  schemas/     配置模型
-  services/    任务与流程编排
-  storage/     SQLite 持久化
-  ui/          Streamlit 前端
-docs/          产品与模块文档
-tests/         冒烟测试
-```
