@@ -14,6 +14,7 @@ from app.core.type_infer import infer_column_types
 from app.core.validator import validate_columns
 from app.schemas.config import PreprocessConfig
 from app.storage.sqlite_store import (
+    append_task_step_log,
     complete_task_run,
     create_task_run,
     fail_task_run,
@@ -45,6 +46,7 @@ def run_preprocess_with_source(
     dataset_id: str | None = None,
     persist_output: bool = False,
     field_metadata: Dict[str, dict] | None = None,
+    db_path: str | Path | None = None,
 ) -> Dict:
     task_record = create_task_run(
         task_type="preprocess",
@@ -56,18 +58,88 @@ def run_preprocess_with_source(
             "save_artifacts": config.save_artifacts,
             "split_enabled": config.split is not None,
         },
+        db_path=db_path,
     )
     task_id = task_record["task_id"]
 
     try:
+        append_task_step_log(
+            task_id,
+            step_name="载入数据集",
+            step_status="done",
+            log_level="info",
+            message=f"已载入数据集，共 {df.shape[0]} 行、{df.shape[1]} 列。",
+            db_path=db_path,
+        )
+
         analysis = analyze_dataframe(df)
         inferred_types = analysis["inferred_types"]
-        cleaned_df, clean_log, resolved_types = clean_dataframe(df, inferred_types, config)
-        validation_findings = validate_columns(cleaned_df, resolved_types, config.column_configs)
-        transformed_df, transform_log = transform_dataframe(cleaned_df, resolved_types, config)
-        splits = split_dataframe(transformed_df, config.split)
-        run_log = {**clean_log, **transform_log}
+        suggestion_count = len(analysis["type_review_suggestions"])
+        append_task_step_log(
+            task_id,
+            step_name="自动识别字段类型",
+            step_status="done",
+            log_level="warning" if suggestion_count > 0 else "info",
+            message=(
+                f"字段类型识别完成，检测到 {suggestion_count} 个建议人工确认的字段。"
+                if suggestion_count > 0
+                else "字段类型识别完成，当前未发现需要人工确认的字段。"
+            ),
+            detail={"suggestion_count": suggestion_count},
+            db_path=db_path,
+        )
 
+        cleaned_df, clean_log, resolved_types = clean_dataframe(df, inferred_types, config)
+        append_task_step_log(
+            task_id,
+            step_name="数据清洗",
+            step_status="done",
+            log_level="info",
+            message=f"数据清洗完成，维度由 {list(df.shape)} 变为 {list(cleaned_df.shape)}。",
+            detail={"clean_log": clean_log},
+            db_path=db_path,
+        )
+
+        validation_findings = validate_columns(cleaned_df, resolved_types, config.column_configs)
+        validation_issue_count = sum(len(items) for items in validation_findings.values())
+        append_task_step_log(
+            task_id,
+            step_name="字段约束校验",
+            step_status="done",
+            log_level="warning" if validation_issue_count > 0 else "info",
+            message=(
+                f"字段约束校验完成，发现 {validation_issue_count} 条待关注问题。"
+                if validation_issue_count > 0
+                else "字段约束校验完成，当前未发现约束问题。"
+            ),
+            detail={"validation_findings": validation_findings},
+            db_path=db_path,
+        )
+
+        transformed_df, transform_log = transform_dataframe(cleaned_df, resolved_types, config)
+        append_task_step_log(
+            task_id,
+            step_name="特征转换",
+            step_status="done",
+            log_level="info",
+            message=f"特征转换完成，维度由 {list(cleaned_df.shape)} 变为 {list(transformed_df.shape)}。",
+            detail={"transform_log": transform_log},
+            db_path=db_path,
+        )
+
+        splits = split_dataframe(transformed_df, config.split)
+        split_keys = sorted(splits.keys())
+        append_task_step_log(
+            task_id,
+            step_name="数据切分",
+            step_status="done",
+            log_level="info",
+            message=f"数据切分完成，生成分片：{split_keys}。",
+            detail={"split_keys": split_keys},
+            db_path=db_path,
+        )
+
+        run_log = {**clean_log, **transform_log}
         artifacts = {}
         if config.save_artifacts:
             artifacts = save_run_artifacts(
@@ -80,6 +152,15 @@ def run_preprocess_with_source(
                 config=config,
                 artifact_root=artifact_root or _default_artifact_root(),
                 source_name=source_name,
+            )
+            append_task_step_log(
+                task_id,
+                step_name="本地产物保存",
+                step_status="done",
+                log_level="info",
+                message="预处理产物已保存到本地 artifacts 目录。",
+                detail={"run_dir": artifacts.get("run_dir")},
+                db_path=db_path,
             )
 
         preprocess_storage = None
@@ -94,6 +175,16 @@ def run_preprocess_with_source(
                 field_metadata=field_metadata or {},
                 preprocess_config=config.model_dump(),
                 validation_findings=validation_findings,
+                db_path=db_path,
+            )
+            append_task_step_log(
+                task_id,
+                step_name="结果落库",
+                step_status="done",
+                log_level="info",
+                message="预处理结果已写入 SQLite。",
+                detail=preprocess_storage,
+                db_path=db_path,
             )
 
         task_summary = complete_task_run(
@@ -103,9 +194,10 @@ def run_preprocess_with_source(
                 "cleaned_shape": list(cleaned_df.shape),
                 "transformed_shape": list(transformed_df.shape),
                 "artifact_run_dir": artifacts.get("run_dir") if artifacts else None,
-                "validation_issue_count": sum(len(v) for v in validation_findings.values()),
+                "validation_issue_count": validation_issue_count,
                 "preprocess_run_id": preprocess_storage["preprocess_run_id"] if preprocess_storage else None,
             },
+            db_path=db_path,
         )
 
         return {
@@ -121,7 +213,15 @@ def run_preprocess_with_source(
             "preprocess_storage": preprocess_storage,
         }
     except Exception as exc:
-        fail_task_run(task_id, error_message=str(exc))
+        append_task_step_log(
+            task_id,
+            step_name="任务失败",
+            step_status="failed",
+            log_level="error",
+            message=f"预处理任务失败：{exc}",
+            db_path=db_path,
+        )
+        fail_task_run(task_id, error_message=str(exc), db_path=db_path)
         raise
 
 
@@ -130,11 +230,13 @@ def persist_raw_dataframe(
     *,
     dataset_name: str,
     source_file_name: str | None = None,
+    db_path: str | Path | None = None,
 ) -> Dict:
     return save_raw_dataset(
         df,
         dataset_name=dataset_name,
         source_file_name=source_file_name,
+        db_path=db_path,
     )
 
 
@@ -147,6 +249,7 @@ def persist_preprocessed_dataframe(
     field_metadata: Dict[str, dict],
     preprocess_config: Dict,
     validation_findings: Dict[str, list[str]],
+    db_path: str | Path | None = None,
 ) -> Dict:
     return save_preprocessed_dataset(
         df,
@@ -156,6 +259,7 @@ def persist_preprocessed_dataframe(
         field_metadata=field_metadata,
         preprocess_config=preprocess_config,
         validation_findings=validation_findings,
+        db_path=db_path,
     )
 
 

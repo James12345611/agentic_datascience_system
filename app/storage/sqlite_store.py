@@ -71,6 +71,52 @@ def ensure_database(db_path: str | Path | None = None) -> Path:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_step_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                step_name TEXT NOT NULL,
+                step_status TEXT NOT NULL,
+                log_level TEXT NOT NULL,
+                message TEXT NOT NULL,
+                detail_json TEXT,
+                created_time TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_dictionary_override (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dataset_id TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                data_type TEXT,
+                semantic_type TEXT,
+                unit TEXT,
+                soft_range TEXT,
+                note TEXT,
+                updated_time TEXT NOT NULL,
+                UNIQUE(dataset_id, field_name)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_dictionary_revision (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dataset_id TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                data_type TEXT,
+                semantic_type TEXT,
+                unit TEXT,
+                soft_range TEXT,
+                note TEXT,
+                actor TEXT,
+                created_time TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_preprocessed_dataset_id ON preprocessed_data(dataset_id)"
         )
         conn.execute(
@@ -81,6 +127,15 @@ def ensure_database(db_path: str | Path | None = None) -> Path:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_task_run_type_status ON task_run(task_type, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_step_log_task_id ON task_step_log(task_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dictionary_override_dataset ON dataset_dictionary_override(dataset_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dictionary_revision_dataset ON dataset_dictionary_revision(dataset_id)"
         )
         conn.commit()
 
@@ -357,6 +412,76 @@ def list_task_runs(
     ]
 
 
+def append_task_step_log(
+    task_id: str,
+    *,
+    step_name: str,
+    step_status: str,
+    log_level: str,
+    message: str,
+    detail: Dict[str, Any] | None = None,
+    db_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    path = ensure_database(db_path)
+    created_time = _now_iso()
+    detail_json = json.dumps(detail or {}, ensure_ascii=False, default=str)
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO task_step_log (
+                task_id, step_name, step_status, log_level, message, detail_json, created_time
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (task_id, step_name, step_status, log_level, message, detail_json, created_time),
+        )
+        conn.commit()
+
+    return {
+        "task_id": task_id,
+        "step_name": step_name,
+        "step_status": step_status,
+        "log_level": log_level,
+        "message": message,
+        "detail_json": detail or {},
+        "created_time": created_time,
+    }
+
+
+def list_task_step_logs(
+    task_id: str,
+    db_path: str | Path | None = None,
+    *,
+    limit: int = 500,
+) -> list[Dict[str, Any]]:
+    path = ensure_database(db_path)
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT task_id, step_name, step_status, log_level, message, detail_json, created_time
+            FROM task_step_log
+            WHERE task_id = ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (task_id, limit),
+        ).fetchall()
+
+    return [
+        {
+            "task_id": row[0],
+            "step_name": row[1],
+            "step_status": row[2],
+            "log_level": row[3],
+            "message": row[4],
+            "detail_json": json.loads(row[5]) if row[5] else {},
+            "created_time": row[6],
+        }
+        for row in rows
+    ]
+
+
 def load_raw_dataset(dataset_id: str, db_path: str | Path | None = None) -> pd.DataFrame:
     path = ensure_database(db_path)
     with sqlite3.connect(path) as conn:
@@ -527,6 +652,161 @@ def find_preprocessed_entry_by_task_id(
         "preprocess_config_json": json.loads(row[8]),
         "validation_findings_json": json.loads(row[9]),
     }
+
+
+def upsert_dataset_dictionary_override(
+    dataset_id: str,
+    *,
+    field_name: str,
+    data_type: str | None = None,
+    semantic_type: str | None = None,
+    unit: str | None = None,
+    soft_range: str | None = None,
+    note: str | None = None,
+    db_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    path = ensure_database(db_path)
+    updated_time = _now_iso()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO dataset_dictionary_override (
+                dataset_id, field_name, data_type, semantic_type, unit, soft_range, note, updated_time
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dataset_id, field_name) DO UPDATE SET
+                data_type = excluded.data_type,
+                semantic_type = excluded.semantic_type,
+                unit = excluded.unit,
+                soft_range = excluded.soft_range,
+                note = excluded.note,
+                updated_time = excluded.updated_time
+            """,
+            (dataset_id, field_name, data_type, semantic_type, unit, soft_range, note, updated_time),
+        )
+        conn.commit()
+
+    return {
+        "dataset_id": dataset_id,
+        "field_name": field_name,
+        "data_type": data_type,
+        "semantic_type": semantic_type,
+        "unit": unit,
+        "soft_range": soft_range,
+        "note": note,
+        "updated_time": updated_time,
+    }
+
+
+def list_dataset_dictionary_overrides(
+    dataset_id: str,
+    db_path: str | Path | None = None,
+) -> list[Dict[str, Any]]:
+    path = ensure_database(db_path)
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT dataset_id, field_name, data_type, semantic_type, unit, soft_range, note, updated_time
+            FROM dataset_dictionary_override
+            WHERE dataset_id = ?
+            ORDER BY field_name ASC
+            """,
+            (dataset_id,),
+        ).fetchall()
+
+    return [
+        {
+            "dataset_id": row[0],
+            "field_name": row[1],
+            "data_type": row[2],
+            "semantic_type": row[3],
+            "unit": row[4],
+            "soft_range": row[5],
+            "note": row[6],
+            "updated_time": row[7],
+        }
+        for row in rows
+    ]
+
+
+def create_dataset_dictionary_revision(
+    dataset_id: str,
+    *,
+    field_name: str,
+    data_type: str | None = None,
+    semantic_type: str | None = None,
+    unit: str | None = None,
+    soft_range: str | None = None,
+    note: str | None = None,
+    actor: str | None = None,
+    db_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    path = ensure_database(db_path)
+    created_time = _now_iso()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO dataset_dictionary_revision (
+                dataset_id, field_name, data_type, semantic_type, unit, soft_range, note, actor, created_time
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (dataset_id, field_name, data_type, semantic_type, unit, soft_range, note, actor, created_time),
+        )
+        conn.commit()
+
+    return {
+        "dataset_id": dataset_id,
+        "field_name": field_name,
+        "data_type": data_type,
+        "semantic_type": semantic_type,
+        "unit": unit,
+        "soft_range": soft_range,
+        "note": note,
+        "actor": actor,
+        "created_time": created_time,
+    }
+
+
+def list_dataset_dictionary_revisions(
+    dataset_id: str,
+    db_path: str | Path | None = None,
+    *,
+    field_name: str | None = None,
+    limit: int = 100,
+) -> list[Dict[str, Any]]:
+    path = ensure_database(db_path)
+    query = """
+        SELECT dataset_id, field_name, data_type, semantic_type, unit, soft_range, note, actor, created_time
+        FROM dataset_dictionary_revision
+        WHERE dataset_id = ?
+    """
+    params: list[Any] = [dataset_id]
+    if field_name:
+        query += " AND field_name = ?"
+        params.append(field_name)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    return [
+        {
+            "dataset_id": row[0],
+            "field_name": row[1],
+            "data_type": row[2],
+            "semantic_type": row[3],
+            "unit": row[4],
+            "soft_range": row[5],
+            "note": row[6],
+            "actor": row[7],
+            "created_time": row[8],
+        }
+        for row in rows
+    ]
 
 
 def _build_schema(df: pd.DataFrame) -> Dict[str, str]:
